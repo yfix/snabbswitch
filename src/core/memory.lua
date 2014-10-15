@@ -6,13 +6,6 @@ local C = ffi.C
 local lib = require("core.lib")
 require("core.memory_h")
 
-
--- hook variables
-
-dma_alloc = nil         -- (size) => ram_ptr, io_address
-allocate_RAM = nil      -- (size) => ram_ptr
-ram_to_io_addr = nil    -- (ram_ptr) => io_address
-
 --- ### Serve small allocations from hugepage "chunks"
 
 -- List of all allocated huge pages: {pointer, physical, size, used}
@@ -39,8 +32,10 @@ end
 
 -- Add a new chunk.
 function allocate_next_chunk ()
-   local ptr = assert(allocate_RAM(huge_page_size), "Couldn't allocate a chunk of ram")
-   local mem_phy = assert(ram_to_io_addr(ptr, huge_page_size), "Couln't map a chunk of ram to IO address")
+   local ptr = assert(allocate_hugetlb_chunk(huge_page_size),
+                      "Failed to allocate a huge page for DMA")
+   local mem_phy = assert(virtual_to_physical(ptr, huge_page_size),
+                          "Failed to resolve memory DMA address")
    chunks[#chunks + 1] = { pointer = ffi.cast("char*", ptr),
                            physical = mem_phy,
                            size = huge_page_size,
@@ -52,8 +47,12 @@ end
 
 --- ### HugeTLB: Allocate contiguous memory in bulk from Linux
 
--- Configuration option: Set to false to disable HugeTLB.
-use_hugetlb = true
+function allocate_hugetlb_chunk ()
+   for i =1, 3 do
+      local page = C.allocate_huge_page(huge_page_size)
+      if page ~= nil then return page else reserve_new_page() end
+   end
+end
 
 function reserve_new_page ()
    set_hugepages(get_hugepages() + 1)
@@ -70,33 +69,33 @@ end
 function get_huge_page_size ()
    local meminfo = lib.readfile("/proc/meminfo", "*a")
    local _,_,hugesize = meminfo:find("Hugepagesize: +([0-9]+) kB")
-   return hugesize
-      and tonumber(hugesize) * 1024
-       or base_page_size -- use base page size as default value
+   assert(hugesize, "HugeTLB available")
+   return tonumber(hugesize) * 1024
 end
 
 base_page_size = 4096
+-- Huge page size in bytes
 huge_page_size = get_huge_page_size()
+-- Address bits per huge page (2MB = 21 bits; 1GB = 30 bits)
+huge_page_bits = math.log(huge_page_size, 2)
 
 --- ### Physical address translation
 
--- Convert from virtual address (pointer) to physical address (uint64_t).
 function virtual_to_physical (virt_addr)
    virt_addr = ffi.cast("uint64_t", virt_addr)
    local virt_page = tonumber(virt_addr / base_page_size)
-   local offset    = tonumber(virt_addr % base_page_size)
-   local phys_page = C.phys_page(virt_page)
+   local phys_page = C.phys_page(virt_page) * base_page_size
    if phys_page == 0 then
       error("Failed to resolve physical address of "..tostring(virt_addr))
    end
-   return ffi.cast("uint64_t", phys_page * base_page_size + offset)
+   local phys_addr = ffi.cast("uint64_t", phys_page + virt_addr % base_page_size)
+   return phys_addr
 end
 
 --- ### selftest
 
 function selftest (options)
    print("selftest: memory")
-   require("lib.hardware.bus")
    print("HugeTLB pages (/proc/sys/vm/nr_hugepages): " .. get_hugepages())
    for i = 1, 4 do
       io.write("  Allocating a "..(huge_page_size/1024/1024).."MB HugeTLB: ")
@@ -115,21 +114,8 @@ end
 
 --- This module requires a stable physical-virtual mapping so this is
 --- enforced automatically at load-time.
-
-function set_use_physical_memory()
-    ram_to_io_addr = virtual_to_physical
-    assert(C.lock_memory() == 0)     -- let's hope it's not needed anymore
+function module_init ()
+   assert(C.lock_memory() == 0)
 end
 
-function set_default_allocator(use_hugetlb)
-    if use_hugetlb and lib.can_write("/proc/sys/vm/nr_hugepages") then
-        allocate_RAM = function(size)
-            for i =1, 3 do
-                local page = C.allocate_huge_page(size)
-                if page ~= nil then return page else reserve_new_page() end
-            end
-        end
-    else
-        allocate_RAM = C.malloc
-    end
-end
+module_init()

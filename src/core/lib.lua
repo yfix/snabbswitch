@@ -173,6 +173,15 @@ function comma_value(n) -- credit http://richard.warburton.it
    return left..(num:reverse():gsub('(%d%d%d)','%1,'):reverse())..right
 end
 
+function random_data(length)
+   result = ""
+   math.randomseed(os.time())
+   for i=1,length do
+      result = result..string.char(math.random(0, 255))
+   end
+   return result
+end
+
 -- Return a table for bounds-checked array access.
 function bounds_checked (type, base, offset, size)
    type = ffi.typeof(type)
@@ -246,7 +255,7 @@ function update_csum (ptr, len,  csum0)
    for i = 0, len-2, 2 do
       sum = sum + bit.lshift(ptr[i], 8) + ptr[i+1]
    end
-   if len % 2 == 1 then sum = sum + bit.lshift(ptr[len-1]) end
+   if len % 2 == 1 then sum = sum + bit.lshift(ptr[len-1], 1) end
    return sum
 end
 
@@ -257,12 +266,49 @@ function finish_csum (sum)
    return bit.band(bit.bnot(sum), 0xffff)
 end
 
-function malloc (type)
-   local ffi_type = ffi.typeof(type)
-   local size = ffi.sizeof(ffi_type)
-   local ptr = C.malloc(size)
-   return ffi.cast(ffi.typeof("$*", ffi_type), ptr)
+
+function malloc (etype)
+   if type(etype) == 'string' then
+      etype = ffi.typeof(etype)
+   end
+   local size = ffi.sizeof(etype)
+   local ptr = memory.dma_alloc(size)
+   return ffi.cast(ffi.typeof("$*", etype), ptr)
 end
+
+
+-- deepcopy from http://lua-users.org/wiki/CopyTable
+-- with naive ctype support
+function deepcopy(orig)
+   local orig_type = type(orig)
+   local copy
+   if orig_type == 'table' then
+      copy = {}
+      for orig_key, orig_value in next, orig, nil do
+         copy[deepcopy(orig_key)] = deepcopy(orig_value)
+      end
+      setmetatable(copy, deepcopy(getmetatable(orig)))
+   elseif orig_type == 'ctype' then
+      copy = ffi.new(ffi.typeof(orig))
+      ffi.copy(copy, orig, ffi.sizeof(orig))
+   else -- number, string, boolean, etc
+      copy = orig
+   end
+   return copy
+end
+
+-- endian conversion helpers written in Lua
+-- avoid C function call overhead while using C.xxxx counterparts
+if ffi.abi("be") then
+   -- nothing to do
+   function htonl(b) return b end
+   function htons(b) return b end
+else
+   function htonl(b) return bit.bswap(b) end
+   function htons(b) return bit.rshift(bit.bswap(b), 16) end
+end
+ntohl = htonl
+ntohs = htons
 
 function selftest ()
    print("selftest: lib")
@@ -278,4 +324,3 @@ function selftest ()
    assert(hexundump('4500 B67D 00FA400040 11', 10)
          =='\x45\x00\xb6\x7d\x00\xFA\x40\x00\x40\x11', "wrong hex undump")
 end
-

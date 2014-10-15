@@ -38,6 +38,7 @@ struct vio_used {
 enum {
   VIRTIO_NET_F_CSUM       = 1 << 0,      // Host handles pkts w/ partial csum
   VIRTIO_NET_F_GUEST_CSUM = 1 << 1,      // Guest handles pkts w/ partial csum
+  VIRTIO_NET_F_CTRL_GUEST_OFFLOADS = 1 << 2, // Control channel offloads reconfiguration support.
   VIRTIO_NET_F_MAC        = 1 << 5,      // Host has given MAC address.
   VIRTIO_NET_F_GSO        = 1 << 6,      // Host handles pkts w/ any GSO type
   VIRTIO_NET_F_GUEST_TSO4 = 1 << 7,      // Guest can handle TSOv4 in.
@@ -58,7 +59,22 @@ enum {
   VIRTIO_NET_F_MQ         = 1 << 22,     // Device supports Receive Flow Steering
   VIRTIO_NET_F_CTRL_MAC_ADDR = 1 << 23   // Set MAC address
 };
-  
+
+enum {
+    VIRTIO_F_NOTIFY_ON_EMPTY = 1 << 24,  /* We notify when the ring is completely used,
+                                            even if the guest is suppressing callbacks */
+    VIRTIO_F_ANY_LAYOUT = 1 << 27,         // Can the device handle any descriptor layout?
+    VIRTIO_RING_F_INDIRECT_DESC = 1 << 28, // We support indirect buffer descriptors
+    VIRTIO_RING_F_EVENT_IDX = 1 << 29,     /* The Guest publishes the used index for which
+                                              it expects an interrupt at the end of the avail
+                                              ring. Host should ignore the avail->flags field.
+                                              The Host publishes the avail index for which
+                                              it expects a kick at the end of the used ring.
+                                              Guest should ignore the used->flags field. */
+    VIRTIO_F_BAD_FEATURE = 1 << 30          /* A guest should never accept this.  It implies
+                                              negotiation is broken. */
+};
+
 struct virtio_net_hdr {
   uint8_t flags;		// See flags enum above
   uint8_t gso_type;		// See GSO type above

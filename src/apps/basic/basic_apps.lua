@@ -2,8 +2,11 @@ module(...,package.seeall)
 
 local app = require("core.app")
 local buffer = require("core.buffer")
+local freelist = require("core.freelist")
 local packet = require("core.packet")
 local link = require("core.link")
+local transmit, receive = link.transmit, link.receive
+
 
 local ffi = require("ffi")
 local C = ffi.C
@@ -22,25 +25,42 @@ end
 
 --- # `Source` app: generate synthetic packets
 
-Source = setmetatable({}, {__index = Basic})
+Source = setmetatable({zone = "Source"}, {__index = Basic})
 
-function Source:new()
-   return setmetatable({}, {__index=Source})
+function Source:new(size)
+   return setmetatable({size=tonumber(size) or 60}, {__index=Source})
+end
+
+-- Allocate receive buffers from the given freelist.
+function Source:set_rx_buffer_freelist (fl)
+   assert(fl)
+   self.rx_buffer_freelist = fl
 end
 
 function Source:pull ()
+   local fl = self.rx_buffer_freelist
    for _, o in ipairs(self.outputi) do
       for i = 1, link.nwritable(o) do
+         local b = nil
+         if fl then
+            if freelist.nfree(fl) > 0 then
+               b = freelist.remove(fl)
+            else
+               return
+            end
+         else
+            b = buffer.allocate()
+         end
          local p = packet.allocate()
-         packet.add_iovec(p, buffer.allocate(), 60)
-         link.transmit(o, p)
+         packet.add_iovec(p, b, self.size)
+         transmit(o, p)
       end
    end
 end
 
 --- # `Join` app: Merge multiple inputs onto one output
 
-Join = setmetatable({}, {__index = Basic})
+Join = setmetatable({zone = "Join"}, {__index = Basic})
 
 function Join:new()
    return setmetatable({}, {__index=Join})
@@ -49,7 +69,7 @@ end
 function Join:push () 
    for _, inport in ipairs(self.inputi) do
       for n = 1,math.min(link.nreadable(inport), link.nwritable(self.output.out)) do
-         link.transmit(self.output.out, link.receive(inport))
+         transmit(self.output.out, receive(inport))
       end
    end
 end
@@ -58,7 +78,7 @@ end
 
 -- For each input port, push packets onto outputs. When one output
 -- becomes full then continue with the next.
-Split = setmetatable({}, {__index = Basic})
+Split = setmetatable({zone = "Split"}, {__index = Basic})
 
 function Split:new ()
    return setmetatable({}, {__index=Split})
@@ -68,7 +88,7 @@ function Split:push ()
    for _, i in ipairs(self.inputi) do
       for _, o in ipairs(self.outputi) do
          for _ = 1, math.min(link.nreadable(i), link.nwritable(o)) do
-            link.transmit(o, link.receive(i))
+            transmit(o, receive(i))
          end
       end
    end
@@ -76,7 +96,7 @@ end
 
 --- ### `Sink` app: Receive and discard packets
 
-Sink = setmetatable({}, {__index = Basic})
+Sink = setmetatable({zone = "Sink"}, {__index = Basic})
 
 function Sink:new ()
    return setmetatable({}, {__index=Sink})
@@ -85,7 +105,7 @@ end
 function Sink:push ()
    for _, i in ipairs(self.inputi) do
       for _ = 1, link.nreadable(i) do
-        local p = link.receive(i)
+        local p = receive(i)
         packet.deref(p)
       end
    end
@@ -98,7 +118,7 @@ end
 -- Assumed to be used in pair with FastRepeater
 -- FastSink doesn't calculate rx statistics
 
-FastSink = setmetatable({}, {__index = Basic})
+FastSink = setmetatable({zone = "FastSink"}, {__index = Basic})
 
 function FastSink:new ()
    return setmetatable({}, {__index=Sink})
@@ -113,7 +133,7 @@ end
 
 --- ### `Tee` app: Send inputs to all outputs
 
-Tee = setmetatable({}, {__index = Basic})
+Tee = setmetatable({zone = "Tee"}, {__index = Basic})
 
 function Tee:new ()
    return setmetatable({}, {__index=Tee})
@@ -128,12 +148,14 @@ function Tee:push ()
       end
       for _, i in ipairs(self.inputi) do
          for _ = 1, math.min(link.nreadable(i), maxoutput) do
-            local p = link.receive(i)
+            local p = receive(i)
             packet.ref(p, noutputs - 1)
             maxoutput = maxoutput - 1
-            for _, o in ipairs(self.outputi) do
-               link.transmit(o, p)
-            end
+	    do local outputi = self.outputi
+	       for k = 1, #outputi do
+		  transmit(outputi[k], p)
+	       end
+	    end
          end
       end
    end
@@ -141,7 +163,7 @@ end
 
 --- ### `Repeater` app: Send all received packets in a loop
 
-Repeater = setmetatable({}, {__index = Basic})
+Repeater = setmetatable({zone = "Repeater"}, {__index = Basic})
 
 function Repeater:new ()
    return setmetatable({index = 1, packets = {}},
@@ -151,7 +173,7 @@ end
 function Repeater:push ()
    local i, o = self.input.input, self.output.output
    for _ = 1, link.nreadable(i) do
-      local p = link.receive(i)
+      local p = receive(i)
       packet.tenure(p)
       table.insert(self.packets, p)
    end
@@ -159,7 +181,7 @@ function Repeater:push ()
    if npackets > 0 then
       for i = 1, link.nwritable(o) do
          assert(self.packets[self.index])
-         link.transmit(o, self.packets[self.index])
+         transmit(o, self.packets[self.index])
          self.index = (self.index % npackets) + 1
       end
    end
@@ -171,7 +193,7 @@ end
 -- Only for test purpose, never use it in real world application
 -- Assumed to be used in pair with FastSink
 
-FastRepeater = setmetatable({}, {__index = Basic})
+FastRepeater = setmetatable({zone = "FastRepeater"}, {__index = Basic})
 
 function FastRepeater:new ()
    return setmetatable({init = true},
@@ -189,7 +211,7 @@ do
          local i = self.input.input
          local npackets = link.nreadable(i)
          for index = 1, npackets do
-            local p = link.receive(i)
+            local p = receive(i)
             packet.tenure(p)
             o.packets[index - 1] = p
          end
@@ -211,7 +233,7 @@ end
 
 --- ### `Buzz` app: Print a debug message when called
 
-Buzz = setmetatable({}, {__index = Basic})
+Buzz = setmetatable({zone = "Buzz"}, {__index = Basic})
 
 function Buzz:new ()
    return setmetatable({}, {__index=Buzz})

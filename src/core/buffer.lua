@@ -8,9 +8,9 @@ local C = ffi.C
 
 require("core.packet_h")
 
-max       = 10e5
-allocated = 0
-size      = 4096
+max        = 10e5
+allocated  = 0
+buffersize = 4096
 
 buffers = freelist.new("struct buffer *", max)
 buffer_t = ffi.typeof("struct buffer")
@@ -29,19 +29,32 @@ end
 function new_buffer ()
    assert(allocated < max, "out of buffers")
    allocated = allocated + 1
-   local pointer, physical, bytes = memory.dma_alloc(size)
+   local pointer, physical, bytes = memory.dma_alloc(buffersize)
    local b = lib.malloc("struct buffer")
-   b.pointer, b.physical, b.size = pointer, physical, size
+   b.pointer, b.physical, b.size = pointer, physical, buffersize
+   b.origin.type = C.BUFFER_ORIGIN_UNKNOWN
    return b
 end
 
+
+local net_device = require("lib.virtio.net_device")
+local return_virtio_buffer = net_device.VirtioNetDevice.return_virtio_buffer
+
+
 -- Free a buffer that is no longer in use.
 function free (b)
-   freelist.add(buffers, b)
    if b.origin.type == C.BUFFER_ORIGIN_VIRTIO then
-      virtio_devices[b.origin.info.virtio.device_id]:return_virtio_buffer(b)
+      local dev = virtio_devices[b.origin.info.virtio.device_id]
+      return_virtio_buffer(dev, b)
+   else
+      freelist.add(buffers, b)
    end
 end
+
+-- Accessors for important structure elements.
+function pointer (b)  return b.pointer  end
+function physical (b) return b.physical end
+function size (b)     return b.size     end
 
 -- Create buffers until at least N are ready for use.
 -- This is a way to pay the cost of allocating buffer memory in advance.

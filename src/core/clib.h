@@ -1,5 +1,14 @@
+// sleep(3) - suspend execution for second intervals
+unsigned int sleep(unsigned int seconds);
+
 // usleep(3) - suspend execution for microsecond intervals
 int usleep(unsigned long usec);
+
+// alarm(3) - schedule signal after given number of seconds 
+unsigned alarm(unsigned seconds);
+
+// ualarm(3) - schedule signal after given number of microseconds 
+unsigned long ualarm(unsigned long usecs, unsigned long interval);
 
 // memcpy(3) - copy memory area
 void memcpy(void *dest, const void *src, size_t n);
@@ -9,6 +18,9 @@ void *memset(void *s, int c, size_t n);
 
 // memcmp(3)
 int memcmp(const void *s1, const void *s2, int n);
+
+// memmove(3)
+void *memmove(void *dest, const void *src, int n);
 
 // strncpy(3) - copy a string
 char *strncpy(char *dest, const char *src, size_t n);
@@ -21,6 +33,9 @@ int write(int fd, void *buf, size_t count);
 
 // fork(2) - create a child process
 int fork();
+
+// close(2) - close a file descriptor
+int close(int fd);
 
 // pread(2), pwrite(2) - read/write from a file descriptor at an offset
 size_t pread(int fd, void *buf, int count, int offset);
@@ -42,3 +57,7 @@ uint16_t htons(uint16_t);
 uint16_t ntohs(uint16_t);
 uint32_t htonl(uint32_t);
 uint32_t ntohl(uint32_t);
+
+// geteuid(2) - get effective user identity
+int geteuid();
+

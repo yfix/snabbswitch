@@ -7,24 +7,26 @@ local C = ffi.C
 
 local buffer   = require("core.buffer")
 local freelist = require("core.freelist")
+local lib      = require("core.lib")
 local memory   = require("core.memory")
+local freelist_add, freelist_remove = freelist.add, freelist.remove
 
 require("core.packet_h")
 
-initial_fuel = 1000
-max_packets = 1e6
+local max_packets = 1e6
 packets_fl = freelist.new("struct packet *", max_packets)
-packets    = ffi.new("struct packet[?]", max_packets)
+local packet_size = ffi.sizeof("struct packet")
+
 
 function module_init ()
    for i = 0, max_packets-1 do
-      free(packets[i])
+      free(ffi.cast("struct packet *", memory.dma_alloc(packet_size)))
    end
 end
 
 -- Return a packet, or nil if none is available.
 function allocate ()
-   return freelist.remove(packets_fl) or error("out of packets")
+   return freelist_remove(packets_fl) or error("out of packets")
 end
 
 -- Append data to a packet.
@@ -56,6 +58,14 @@ function prepend_iovec (p, b, length,  offset)
    p.length = p.length + length
 end
 
+function niovecs (p)
+   return p.niovecs
+end
+
+function iovec (p, n)
+   return p.iovecs[n]
+end
+
 -- Merge all buffers into one. Throws an exception if a single buffer
 -- cannot hold the entire packet.
 --
@@ -75,6 +85,72 @@ function coalesce (p)
    end
    p.niovecs, p.length = 0, 0
    add_iovec(p, b, length)
+end
+
+-- The same as coalesce(), but allocate new packet
+-- while leaving original packet unchanged
+function clone (p)
+   local new_p = allocate()
+   local b = buffer.allocate()
+   assert(p.length <= b.size, "packet too big to coalesce")
+
+   local length = 0
+   for i = 0, p.niovecs - 1 do
+      local iovec = p.iovecs[i]
+      ffi.copy(b.pointer + length, iovec.buffer.pointer + iovec.offset, iovec.length)
+      length = length + iovec.length
+   end
+   add_iovec(new_p, b, length)
+   return new_p
+end
+
+-- The opposite of coalesce
+-- Scatters the data through chunks
+function scatter (p, sg_list)
+   assert(#sg_list + 1 <= C.PACKET_IOVEC_MAX)
+   local cloned = clone(p) -- provide coalesced copy
+   local result = allocate()
+   local iovec = cloned.iovecs[0]
+   local offset = 0 -- the offset in the cloned buffer
+
+   -- always append one big chunk in the end, to cover the case
+   -- where the supplied sgs are not sufficient to hold all the data
+   -- also if we get an empty sg_list this will make a single iovec packet
+   local pattern_list = lib.deepcopy(sg_list)
+   pattern_list[#pattern_list + 1] = {4096}
+
+   for _,sg in ipairs(pattern_list) do
+      local sg_len = sg[1]
+      local sg_offset = sg[2] or 0
+      local b = buffer.allocate()
+
+      assert(sg_len + sg_offset <= b.size)
+      local to_copy = math.min(sg_len, iovec.length - offset)
+      ffi.copy(b.pointer + sg_offset, iovec.buffer.pointer + iovec.offset + offset, to_copy)
+      add_iovec(result, b, to_copy, sg_offset)
+
+      -- advance the offset in the source buffer
+      offset = offset + to_copy
+      assert(offset <= iovec.length)
+      if offset == iovec.length then
+         -- we don't have more data to copy
+         break
+      end
+   end
+   packet.deref(cloned)
+   return result
+end
+
+-- use this function if you want to modify a packet received by an app
+-- you cannot modify a packet if it is owned more then one app
+-- it will create a copy for you as needed
+function want_modify (p)
+   if p.refcount == 1 then
+      return p
+   end
+   local new_p = clone(p)
+   packet.deref(p)
+   return new_p
 end
 
 -- fill's an allocated packet with data from a string
@@ -108,7 +184,7 @@ end
 function deref (p,  n)
    n = n or 1
    if p.refcount > 0 then
-      assert(p.refcount >= n)
+      -- assert(p.refcount >= n)
       if n == p.refcount then
          free(p)
       else
@@ -123,14 +199,28 @@ function tenure (p)
 end
 
 -- Free a packet and all of its buffers.
+
+local function free_aux(p, i)
+   buffer.free(p.iovecs[i].buffer)
+end
+
 function free (p)
-   for i = 0, p.niovecs-1 do
-      buffer.free(p.iovecs[i].buffer)
+   local niovecs = p.niovecs
+   if niovecs > 0 then
+      free_aux(p, 0)
    end
-   ffi.fill(p, ffi.sizeof("struct packet"), 0)
+   if niovecs > 1 then
+      free_aux(p, 1)
+   end
+   if niovecs > 2 then
+      for i = 2, p.niovecs-1 do
+	 free_aux(p, i)
+      end
+   end
+   p.length         = 0
+   p.niovecs        = 0
    p.refcount       = 1
-   p.fuel           = initial_fuel
-   freelist.add(packets_fl, p)
+   freelist_add(packets_fl, p)
 end
 
 function iovec_dump (iovec)
@@ -151,9 +241,8 @@ function iovec_dump (iovec)
 end
 
 function report (p)
-   print (string.format([[
+   local result = string.format([[
          refcount: %d
-         fuel: %d
          info.flags: %X
          info.gso_flags: %X
          info.hdr_len: %d
@@ -163,15 +252,17 @@ function report (p)
          niovecs: %d
          length: %d
       ]],
-      p.refcount, p.fuel, p.info.flags, p.info.gso_flags,
+      p.refcount, p.info.flags, p.info.gso_flags,
       p.info.hdr_len, p.info.gso_size, p.info.csum_start,
       p.info.csum_offset, p.niovecs, p.length
-   ))
+   )
    for i = 0, p.niovecs-1 do
-      print(string.format([[
+      result = result .. string.format([[
             iovec #%d: %s
-         ]], i, iovec_dump(p.iovecs[i])))
+         ]], i, iovec_dump(p.iovecs[i]))
    end
+
+   return result
 end
 
 module_init()

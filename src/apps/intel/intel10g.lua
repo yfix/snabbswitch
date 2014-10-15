@@ -11,16 +11,14 @@ module(...,package.seeall)
 local ffi      = require "ffi"
 local C        = ffi.C
 local lib      = require("core.lib")
-local memory   = require("core.memory")
-local packet   = require("core.packet")
-local bus      = require("lib.hardware.bus")
+local pci      = require("lib.hardware.pci")
 local register = require("lib.hardware.register")
-                 require("apps.intel.intel_h")
-                 require("core.packet_h")
 local index_set = require("lib.index_set")
 local macaddress = require("lib.macaddress")
 
 local bits, bitset = lib.bits, lib.bitset
+local band, bor, lshift = bit.band, bit.bor, bit.lshift
+local packet_ref = packet.ref
 
 num_descriptors = 32 * 1024
 --num_descriptors = 32
@@ -34,7 +32,7 @@ local M_sf = {}; M_sf.__index = M_sf
 
 function new_sf (pciaddress)
    local dev = { pciaddress = pciaddress, -- PCI device address
-                 info = bus.device_info(pciaddress),
+                 fd = false,       -- File descriptor for PCI memory
                  r = {},           -- Configuration registers
                  s = {},           -- Statistics registers
                  txdesc = 0,     -- Transmit descriptors (pointer)
@@ -54,15 +52,22 @@ end
 
 
 function M_sf:open ()
-   self.info.set_bus_master(self.pciaddress, true)
-   local base = self.info.map_pci_memory(self.pciaddress, 0)
-   register.define(config_registers_desc, self.r, base)
-   register.define(transmit_registers_desc, self.r, base)
-   register.define(receive_registers_desc, self.r, base)
-   register.define(statistics_registers_desc, self.s, base)
+   pci.set_bus_master(self.pciaddress, true)
+   self.base, self.fd = pci.map_pci_memory(self.pciaddress, 0)
+   register.define(config_registers_desc, self.r, self.base)
+   register.define(transmit_registers_desc, self.r, self.base)
+   register.define(receive_registers_desc, self.r, self.base)
+   register.define(statistics_registers_desc, self.s, self.base)
    self.txpackets = ffi.new("struct packet *[?]", num_descriptors)
    self.rxbuffers = ffi.new("struct buffer *[?]", num_descriptors)
    return self:init()
+end
+
+function M_sf:close()
+   if self.fd then 
+      pci.close_pci_resource(self.fd) 
+      self.fd = false
+   end
 end
 
 --- See data sheet section 4.6.3 "Initialization Sequence."
@@ -83,9 +88,9 @@ end
 
 function M_sf:init_dma_memory ()
    self.rxdesc, self.rxdesc_phy =
-      self.info.dma_alloc(num_descriptors * ffi.sizeof(rxdesc_t))
+      memory.dma_alloc(num_descriptors * ffi.sizeof(rxdesc_t))
    self.txdesc, self.txdesc_phy =
-      self.info.dma_alloc(num_descriptors * ffi.sizeof(txdesc_t))
+      memory.dma_alloc(num_descriptors * ffi.sizeof(txdesc_t))
    -- Add bounds checking
    self.rxdesc = lib.bounds_checked(rxdesc_t, self.rxdesc, 0, num_descriptors)
    self.txdesc = lib.bounds_checked(txdesc_t, self.txdesc, 0, num_descriptors)
@@ -124,16 +129,26 @@ function M_sf:init_receive ()
       TXCRCEN=0, RXCRCSTRP=1, JUMBOEN=2, rsv2=3, TXPADEN=10,
       rsvd3=11, rsvd4=13, MDCSPD=16, RXLNGTHERREN=27,
    })
+   self.r.MAXFRS(lshift(9000+18, 16))
    self:set_receive_descriptors()
    self.r.RXCTRL:set(bits{RXEN=0})
    return self
 end
 
+function M_sf:set_rx_buffersize(rx_buffersize)
+   rx_buffersize = math.min(16, math.floor((rx_buffersize or 16384) / 1024))  -- size in KB, max 16KB
+   assert (rx_buffersize > 0, "rx_buffersize must be more than 1024")
+   self.rx_buffersize = rx_buffersize * 1024
+   self.r.SRRCTL(bits({DesctypeLSB=25}, rx_buffersize))
+   return self
+end
+
 function M_sf:set_receive_descriptors ()
-   self.r.SRRCTL(bits({DesctypeLSB=25}, 4))
+   self:set_rx_buffersize(16384)        -- start at max
+
    self.r.RDBAL(self.rxdesc_phy % 2^32)
    self.r.RDBAH(self.rxdesc_phy / 2^32)
-   self.r.RDLEN(num_descriptors * ffi.sizeof("union rx"))
+   self.r.RDLEN(num_descriptors * ffi.sizeof(rxdesc_t))
    return self
 end
 
@@ -152,14 +167,14 @@ end
 function M_sf:init_transmit ()
    self.r.HLREG0:set(bits{TXCRCEN=0})
    self:set_transmit_descriptors()
-   self.r.DMATXCTL(bits{TE=0})
+   self.r.DMATXCTL:set(bits{TE=0})
    return self
 end
 
 function M_sf:set_transmit_descriptors ()
    self.r.TDBAL(self.txdesc_phy % 2^32)
    self.r.TDBAH(self.txdesc_phy / 2^32)
-   self.r.TDLEN(num_descriptors * ffi.sizeof("union tx"))
+   self.r.TDLEN(num_descriptors * ffi.sizeof(txdesc_t))
    return self
 end
 
@@ -168,21 +183,31 @@ end
 
 --- See datasheet section 7.1 "Inline Functions -- Transmit Functionality."
 
-txdesc_flags = bits{eop=24,ifcs=25, dext=29, dtyp0=20, dtyp1=21}
-txdesc_flags_last = bits({eop=24}, txdesc_flags)
+local txdesc_flags = bits{ifcs=25, dext=29, dtyp0=20, dtyp1=21}
+local txdesc_flags_last = bits({eop=24}, txdesc_flags)
+
+local function transmit_aux (self, p, i, niovecs)
+   local iov = p.iovecs[i]
+   local flags = (i + 1 < niovecs) and txdesc_flags or txdesc_flags_last
+   self.txdesc[self.tdt].address = iov.buffer.physical + iov.offset
+   self.txdesc[self.tdt].options = bor(iov.length, flags, lshift(p.length+0ULL, 46))
+   self.txpackets[self.tdt] = packet_ref(p)
+   self.tdt = band(self.tdt + 1, num_descriptors - 1)
+end
+
 function M_sf:transmit (p)
-   if p.niovecs > 1 then
-      packet.coalesce(p)
+   local niovecs = p.niovecs
+   if niovecs > 0 then
+      transmit_aux(self, p, 0, niovecs)
    end
-   for i = 0, p.niovecs - 1 do
-      local iov = p.iovecs[i]
-      local flags = (i + 1 < p.niovecs) and txdesc_flags or txdesc_flags_last
-      self.txdesc[self.tdt].address = iov.buffer.physical + iov.offset
-      self.txdesc[self.tdt].options = bit.bor(iov.length, flags, bit.lshift(p.length+0ULL, 46))
-      self.txpackets[self.tdt] = p
-      self.tdt = (self.tdt + 1) % num_descriptors
+   if niovecs > 1 then
+      transmit_aux(self, p, 1, niovecs)
    end
-   return packet.ref(p)
+   if niovecs > 2 then
+      for i = 2, niovecs - 1 do
+         transmit_aux(self, p, i, niovecs)
+      end
+   end
 end
 
 function M_sf:sync_transmit ()
@@ -190,48 +215,63 @@ function M_sf:sync_transmit ()
    self.tdh = self.r.TDH()
    C.full_memory_barrier()
    -- Release processed buffers
-   while old_tdh ~= self.tdh do
-      packet.deref(self.txpackets[old_tdh])
-      self.txpackets[old_tdh] = nil
-      old_tdh = (old_tdh + 1) % num_descriptors
+   if old_tdh ~= self.tdh then
+      while old_tdh ~= self.tdh do
+         packet.deref(self.txpackets[old_tdh])
+         self.txpackets[old_tdh] = nil
+         old_tdh = band(old_tdh + 1, num_descriptors - 1)
+      end
    end
    self.r.TDT(self.tdt)
 end
 
 function M_sf:can_transmit ()
-   return (self.tdt + 1) % num_descriptors ~= self.tdh
+   return band(self.tdt + 1, num_descriptors - 1) ~= self.tdh
 end
 
 --- ### Receive
 
 --- See datasheet section 7.1 "Inline Functions -- Receive Functionality."
 
+local function receive_aux(self, p)
+   local wb = self.rxdesc[self.rxnext].wb
+   if band(wb.xstatus_xerror, 1) == 1 then -- Descriptor Done
+      local b = self.rxbuffers[self.rxnext]
+      packet.add_iovec(p, b, wb.pkt_len)
+      self.rxnext = band(self.rxnext + 1, num_descriptors - 1)
+   end
+   return band(wb.xstatus_xerror, 2) == 2  -- End Of Packet
+end
+
 function M_sf:receive ()
    assert(self.rdh ~= self.rxnext)
    local p = packet.allocate()
-   local b = self.rxbuffers[self.rxnext]
-   local wb = self.rxdesc[self.rxnext].wb
-   assert(wb.pkt_len > 0)
-   assert(bit.band(wb.xstatus_xerror, 1) == 1) -- Descriptor Done
-   packet.add_iovec(p, b, wb.pkt_len)
-   self.rxnext = (self.rxnext + 1) % num_descriptors
+   if not receive_aux(self, p) then
+      if not receive_aux(self, p) then
+         repeat
+         until receive_aux(self, p)
+      end
+   end
    return p
 end
 
 function M_sf:can_receive ()
-   return self.rxnext ~= self.rdh and bit.band(self.rxdesc[self.rxnext].wb.xstatus_xerror, 1) == 1
+   return self.rxnext ~= self.rdh and band(self.rxdesc[self.rxnext].wb.xstatus_xerror, 1) == 1
 end
 
 function M_sf:can_add_receive_buffer ()
-   return (self.rdt + 1) % num_descriptors ~= self.rxnext
+   return band(self.rdt + 1, num_descriptors - 1) ~= self.rxnext
 end
 
 function M_sf:add_receive_buffer (b)
    assert(self:can_add_receive_buffer())
+   if b.size < self.rx_buffersize then
+      self:set_rx_buffersize(b.size)
+   end
    local desc = self.rxdesc[self.rdt].data
-   desc.address, desc.dd = b.physical, b.size
+   desc.address, desc.dd = b.physical, 0
    self.rxbuffers[self.rdt] = b
-   self.rdt = (self.rdt + 1) % num_descriptors
+   self.rdt = band(self.rdt + 1, num_descriptors - 1)
 end
 
 function M_sf:sync_receive ()
@@ -244,49 +284,88 @@ function M_sf:sync_receive ()
 end
 
 function M_sf:wait_linkup ()
-   self.r.LINKS:wait(bits{Link_up=30})
+   io.write('waiting...\n')
+   local mask = bits{Link_up=30}
+   for count = 1, 500 do
+      if band(self.r.LINKS(), mask) == mask then
+         return self
+      end
+      C.usleep(1000)
+   end
    return self
 end
 
 --- ### Status and diagnostics
 
+
+-- negotiate access to software/firmware shared resource
+-- section 10.5.4
 function negotiated_autoc (dev, f)
-   lib.waitfor(function()
+   local function waitfor (test, attempts, interval)
+      interval = interval or 100
+      for count = 1,attempts do
+         if test() then return true end
+         C.usleep(interval)
+         io.flush()
+      end
+      return false
+   end
+   local function tb (reg, mask, val)
+      return function() return bit.band(reg(), mask) == (val or mask) end
+   end
+
+   local gotresource = waitfor(function()
       local accessible = false
-      dev.r.SWSM:wait(bits{SMBI=0})        -- TODO: expire at 10ms
+      local softOK = waitfor (tb(dev.r.SWSM, bits{SMBI=0},0), 30100)
       dev.r.SWSM:set(bits{SWESMBI=1})
-      dev.r.SWSM:wait(bits{SWESMBI=1})     -- TODO: expire at 3s
-      accessible = bit.band(dev.r.SW_FW_SYNC(), 0x8) == 0
+      local firmOK = waitfor (tb(dev.r.SWSM, bits{SWESMBI=1}), 30000)
+      accessible = bit.band(dev.r.SW_FW_SYNC(), 0x108) == 0
+      if not firmOK then
+         dev.r.SW_FW_SYNC:clr(0x03E0)   -- clear all firmware bits
+         accessible = true
+      end
+      if not softOK then
+         dev.r.SW_FW_SYNC:clr(0x1F)     -- clear all software bits
+         accessible = true
+      end
       if accessible then
          dev.r.SW_FW_SYNC:set(0x8)
       end
       dev.r.SWSM:clr(bits{SMBI=0, SWESMBI=1})
-      if not accessible then C.usleep(3000000) end
+      if not accessible then C.usleep(100) end
       return accessible
-   end)   -- TODO: only twice
+   end, 10000)   -- TODO: only twice
+   if not gotresource then error("Can't acquire shared resource") end
+
    local r = f(dev)
-   dev.r.SWSM:wait(bits{SMBI=0})        -- TODO: expire at 10ms
+
+   waitfor (tb(dev.r.SWSM, bits{SMBI=0},0), 30100)
    dev.r.SWSM:set(bits{SWESMBI=1})
-   dev.r.SWSM:wait(bits{SWESMBI=1})     -- TODO: expire at 3s
-   dev.r.SW_FW_SYNC:clr(0x8)
+   waitfor (tb(dev.r.SWSM, bits{SWESMBI=1}), 30000)
+   dev.r.SW_FW_SYNC:clr(0x108)
    dev.r.SWSM:clr(bits{SMBI=0, SWESMBI=1})
    return r
 end
 
-function set_SFI (dev)
+
+function set_SFI (dev, lms)
+   lms = lms or bit.lshift(0x3, 13)         -- 10G SFI
    local autoc = dev.r.AUTOC()
-   autoc = bit.bor(
-      bit.band(autoc, 0xFFFF0C7E),          -- clears FLU, 10g_pma, 1g_pma, restart_AN, LMS
-      bit.lshift(0x3, 13)                   -- LMS(15:13) = 011b
-   )
-   dev.r.AUTOC(autoc)                       -- TODO: firmware synchronization
+   if bit.band(autoc, bit.lshift(0x7, 13)) == lms then
+      dev.r.AUTOC(bits({restart_AN=12}, bit.bxor(autoc, 0x8000)))      -- flip LMS[2] (15)
+      lib.waitfor(function ()
+         return bit.band(dev.r.ANLP1(), 0xF0000) ~= 0
+      end)
+   end
+
+   dev.r.AUTOC(bit.bor(bit.band(autoc, 0xFFFF1FFF), lms))
    return dev
 end
 
 function M_sf:autonegotiate_sfi ()
    return negotiated_autoc(self, function()
       set_SFI(self)
-      self.r.AUTOC:set(bits{reastat_AN=12})
+      self.r.AUTOC:set(bits{restart_AN=12})
       self.r.AUTOC2(0x00020000)
       return self
    end)
@@ -298,7 +377,6 @@ local M_pf = {}; M_pf.__index = M_pf
 
 function new_pf (pciaddress)
    local dev = { pciaddress = pciaddress, -- PCI device address
-                 info = bus.device_info(pciaddress),
                  r = {},           -- Configuration registers
                  s = {},           -- Statistics registers
                  qs = {},          -- queue statistic registers
@@ -310,14 +388,21 @@ function new_pf (pciaddress)
 end
 
 function M_pf:open ()
-   self.info.set_bus_master(self.pciaddress, true)
-   self.base = self.info.map_pci_memory(self.pciaddress, 0)
+   pci.set_bus_master(self.pciaddress, true)
+   self.base, self.fd = pci.map_pci_memory(self.pciaddress, 0)
    register.define(config_registers_desc, self.r, self.base)
    register.define_array(switch_config_registers_desc, self.r, self.base)
    register.define_array(packet_filter_desc, self.r, self.base)
    register.define(statistics_registers_desc, self.s, self.base)
    register.define_array(queue_statistics_registers_desc, self.qs, self.base)
    return self:init()
+end
+
+function M_pf:close()
+   if self.fd then 
+      pci.close_pci_resource(self.fd) 
+      self.fd = false
+   end
 end
 
 function M_pf:init ()
@@ -334,6 +419,7 @@ function M_pf:init ()
       :wait_linkup()
 end
 
+M_pf.close = M_sf.close
 M_pf.global_reset = M_sf.global_reset
 M_pf.disable_interrupts = M_sf.disable_interrupts
 M_pf.set_receive_descriptors = pass
@@ -359,6 +445,7 @@ function M_pf:set_vmdq_mode ()
    self.r.TXPBTHRESH[0](0xA0)
    self.r.FCRTH[0](0x10000)
    self.r.RXDSTATCTRL(0x10)                 -- Rx DMA Statistic for all queues
+   self.r.VLNCTRL:set(bits{VFE=30})         -- Vlan filter enable
    for i = 1, 7 do
       self.r.RXPBSIZE[i](0x00)
       self.r.TXPBSIZE[i](0x00)
@@ -372,12 +459,17 @@ function M_pf:set_vmdq_mode ()
    end
    -- clear PFQDE.QDE (queue drop enable) for each queue
    for i = 0, 127 do
-      self.r.PFQDE(bit.bor(bit.lshift(1,16), bit.lshift(i,8)))
+      self.r.PFQDE(bor(lshift(1,16), lshift(i,8)))
       self.r.FTQF[i](0x00)                 -- disable L3/4 filter
+      self.r.RAH[i](0)
+      self.r.RAL[i](0)
+      self.r.VFTA[i](0)
+      self.r.PFVLVFB[i](0)
    end
    for i = 0, 63 do
       self.r.RTTDQSEL(i)
       self.r.RTTDT1C(0x00)
+      self.r.PFVLVF[i](0)
    end
    for i = 0, 31 do
       self.r.RETA[i](0x00)                 -- clear redirection table
@@ -399,12 +491,12 @@ local M_vf = {}; M_vf.__index = M_vf
 
 -- it's the PF who creates a VF
 function M_pf:new_vf (poolnum)
+   assert(poolnum < 64, "Pool overflow: Intel 82599 can only have up to 64 virtualized devices.")
    local txqn = poolnum*2
    local rxqn = poolnum*2
    local vf = {
       pf = self,
       -- some things are shared with the main device...
-      info = self.info,             -- pci device info
       base = self.base,             -- mmap()ed register file
       s = self.s,                   -- Statistics registers
       -- and others are our own
@@ -445,8 +537,10 @@ function M_vf:init (opts)
       :set_VLAN(opts.vlan)
       :set_rx_stats(opts.rxcounter)
       :set_tx_stats(opts.txcounter)
+      :set_tx_rate(opts.rate_limit, opts.priority)
 end
 
+M_vf.close = M_sf.close
 M_vf.init_dma_memory = M_sf.init_dma_memory
 M_vf.set_receive_descriptors = M_sf.set_receive_descriptors
 M_vf.set_transmit_descriptors = M_sf.set_transmit_descriptors
@@ -456,6 +550,7 @@ M_vf.sync_transmit = M_sf.sync_transmit
 M_vf.can_receive = M_sf.can_receive
 M_vf.receive = M_sf.receive
 M_vf.can_add_receive_buffer = M_sf.can_add_receive_buffer
+M_vf.set_rx_buffersize = M_sf.set_rx_buffersize
 M_vf.add_receive_buffer = M_sf.add_receive_buffer
 M_vf.sync_receive = M_sf.sync_receive
 
@@ -464,8 +559,8 @@ function M_vf:init_receive ()
    self.pf.r.PSRTYPE[poolnum](0)        -- no splitting, use pool's first queue
    self.r.RSCCTL(0x0)                   -- no RSC
    self:set_receive_descriptors()
-   self.pf.r.PFVML2FLT[poolnum]:set(bits{BAM=27, AUPE=24})
-   self.r.RXDCTL(bits{Enable=25})
+   self.pf.r.PFVML2FLT[poolnum]:set(bits{MPE=28, BAM=27, AUPE=24})
+   self.r.RXDCTL(bits{Enable=25, VME=30})
    self.r.RXDCTL:wait(bits{enable=25})
    self.r.DCA_RXCTRL:clr(bits{RxCTRL=12})
    self.pf.r.PFVFRE[math.floor(poolnum/32)]:set(bits{VFRE=poolnum%32})
@@ -476,10 +571,10 @@ function M_vf:init_transmit ()
    local poolnum = self.poolnum or 0
    self.r.TXDCTL:clr(bits{Enable=25})
    self:set_transmit_descriptors()
-   self.pf.r.PFVMTXSW[math.floor(poolnum/32)]:set(bits{LLE=poolnum%32})
+   self.pf.r.PFVMTXSW[math.floor(poolnum/32)]:clr(bits{LLE=poolnum%32})
    self.pf.r.PFVFTE[math.floor(poolnum/32)]:set(bits{VFTE=poolnum%32})
    self.pf.r.RTTDQSEL(poolnum)
-   self.pf.r.RTTDT1C(0x2000)
+   self.pf.r.RTTDT1C(0x80)
    self.pf.r.RTTBCNRC(0x00)         -- no rate limiting
    self.pf.r.DMATXCTL:set(bits{TE=0})
    self.r.TXDCTL:set(bits{Enable=25, SWFLSH=26})
@@ -527,7 +622,7 @@ function M_vf:set_mirror (want_mirror)
 
       -- mirror some or all pools
       if want_mirror.pool then
-         mirror_rule = bit.bor(bits{VPME=0}, mirror_rule)
+         mirror_rule = bor(bits{VPME=0}, mirror_rule)
          if want_mirror.pool == true then       -- mirror all pools
             self.pf.r.PFMRVM[mirror_ndx](0xFFFFFFFF)
             self.pf.r.PFMRVM[mirror_ndx+4](0xFFFFFFFF)
@@ -536,9 +631,9 @@ function M_vf:set_mirror (want_mirror)
             local bm1 = self.pf.r.PFMRVM[mirror_ndx+4]
             for _, pool in ipairs(want_mirror.pool) do
                if pool <= 32 then
-                  bm0 = bit.bor(bit.lshift(1, pool), bm0)
+                  bm0 = bor(lshift(1, pool), bm0)
                else
-                  bm1 = bit.bor(bit.lshift(1, pool-32), bm1)
+                  bm1 = bor(lshift(1, pool-32), bm1)
                end
             end
             self.pf.r.PFMRVM[mirror_ndx](bm0)
@@ -549,20 +644,20 @@ function M_vf:set_mirror (want_mirror)
       -- mirror hardware port
       if want_mirror.port then
          if want_mirror.port == true or want_mirror.port == 'in' or want_mirror.port == 'inout' then
-            mirror_rule = bit.bor(bits{UPME=1}, mirror_rule)
+            mirror_rule = bor(bits{UPME=1}, mirror_rule)
          end
          if want_mirror.port == true or want_mirror.port == 'out' or want_mirror.port == 'inout' then
-            mirror_rule = bit.bor(bits{DPME=2}, mirror_rule)
+            mirror_rule = bor(bits{DPME=2}, mirror_rule)
          end
       end
 
       -- mirror some or all vlans
       if want_mirror.vlan then
-         mirror_rule = bit.bor(bits{VLME=3}, mirror_rule)
+         mirror_rule = bor(bits{VLME=3}, mirror_rule)
             -- TODO: set which vlan's want to mirror
       end
       if mirror_rule ~= 0 then
-         mirror_rule = bit.bor(mirror_rule, bit.lshift(self.poolnum, 8))
+         mirror_rule = bor(mirror_rule, lshift(self.poolnum, 8))
          self.pf.r.PFMRCTL[mirror_ndx]:set(mirror_rule)
       end
    end
@@ -571,7 +666,6 @@ end
 
 function M_vf:set_VLAN (vlan)
    if not vlan then return self end
-
    assert(vlan>=0 and vlan<4096, "bad VLAN number")
    if not vlan then return self end
    return self
@@ -593,7 +687,9 @@ function M_vf:add_receive_VLAN (vlan)
 end
 
 function M_vf:set_tag_VLAN(vlan)
-   -- TODO
+   local poolnum = self.poolnum or 0
+   self.pf.r.PFVFSPOOF[math.floor(poolnum/8)]:set(bits{VLANAS=poolnum%8+8})
+   self.pf.r.PFVMVIR[poolnum](bits({VLANA=30}, vlan))  -- always add VLAN tag
    return self
 end
 
@@ -601,7 +697,7 @@ function M_vf:set_rx_stats (counter)
    if not counter then return self end
    assert(counter>=0 and counter<16, "bad Rx counter")
    self.rxstats = counter
-   self.pf.qs.RQSMR[math.floor(self.rxqn/4)]:set(bit.lshift(counter,8*(self.rxqn%4)))
+   self.pf.qs.RQSMR[math.floor(self.rxqn/4)]:set(lshift(counter,8*(self.rxqn%4)))
    return self
 end
 
@@ -609,7 +705,7 @@ function M_vf:set_tx_stats (counter)
    if not counter then return self end
    assert(counter>=0 and counter<16, "bad Tx counter")
    self.txstats = counter
-   self.pf.qs.TQSM[math.floor(self.txqn/4)]:set(bit.lshift(counter,8*(self.txqn%4)))
+   self.pf.qs.TQSM[math.floor(self.txqn/4)]:set(lshift(counter,8*(self.txqn%4)))
    return self
 end
 
@@ -619,7 +715,7 @@ function M_vf:get_rxstats ()
       counter_id = self.rxstats,
       packets = tonumber(self.pf.qs.QPRC[self.rxstats]()),
       dropped = tonumber(self.pf.qs.QPRDC[self.rxstats]()),
-      bytes = tonumber(bit.lshift(self.pf.qs.QBRC_H[self.rxstats]()+0LL, 32)
+      bytes = tonumber(lshift(self.pf.qs.QBRC_H[self.rxstats]()+0LL, 32)
                + self.pf.qs.QBRC_L[self.rxstats]())
    }
 end
@@ -629,9 +725,25 @@ function M_vf:get_txstats ()
    return {
       counter_id = self.txstats,
       packets = tonumber(self.pf.qs.QPTC[self.txstats]()),
-      bytes = tonumber(bit.lshift(self.pf.qs.QBTC_H[self.txstats]()+0LL, 32)
+      bytes = tonumber(lshift(self.pf.qs.QBTC_H[self.txstats]()+0LL, 32)
                + self.pf.qs.QBTC_L[self.txstats]())
    }
+end
+
+function M_vf:set_tx_rate (limit, priority)
+   limit = tonumber(limit) or 0
+   self.pf.r.RTTDQSEL(self.poolnum)
+   if limit >= 10 then
+      local factor = 10000 / tonumber(limit)       -- line rate = 10,000 Mb/s
+      factor = bit.band(math.floor(factor*2^14+0.5), 2^24-1) -- 10.14 bits
+      self.pf.r.RTTBCNRC(bits({RS_ENA=31}, factor))
+   else
+      self.pf.r.RTTBCNRC(0x00)
+   end
+
+   priority = tonumber(priority) or 1.0
+   self.pf.r.RTTDT1C(bit.band(math.floor(priority * 0x80), 0x3FF))
+   return self
 end
 
 
@@ -661,6 +773,8 @@ txdesc_t = ffi.typeof [[
 --- ### Configuration register description.
 
 config_registers_desc = [[
+ANLP1     0x042B0 -            RO Auto Negotiation Link Partner
+ANLP2     0x042B4 -            RO Auto Negotiation Link Partner 2
 AUTOC     0x042A0 -            RW Auto Negotiation Control
 AUTOC2    0x042A8 -            RW Auto Negotiation Control 2
 CTRL      0x00000 -            RW Device Control
@@ -677,6 +791,8 @@ FCCFG     0x03D00 -            RW Flow Control Configuration
 HLREG0    0x04240 -            RW MAC Core Control 0
 LINKS     0x042A4 -            RO Link Status Register
 LINKS2    0x04324 -            RO Second status link register
+MANC      0x05820 -            RW Management Control Register
+MAXFRS    0x04268 -            RW Max Frame Size
 MNGTXMAP  0x0CD10 -            RW Mangeability Tranxmit TC Mapping
 MFLCN     0x04294 -            RW MAC Flow Control Register
 PFQDE     0x02F04 -            RW PF Queue Drop Enable Register
@@ -705,11 +821,12 @@ PFMRVM    0x0F630 +0x04*0..7    RW PF Mirror Rule Pool
 PFVFRE    0x051E0 +0x04*0..1    RW PF VF Receive Enable
 PFVFTE    0x08110 +0x04*0..1    RW PF VF Transmit Enable
 PFVMTXSW  0x05180 +0x04*0..1    RW PF VM Tx Switch Loopback Enable
+PFVMVIR   0x08000 +0x04*0..63   RW PF VM VLAN Insert Register
 PFVFSPOOF 0x08200 +0x04*0..7    RW PF VF Anti Spoof control
 PFDTXGSWC 0x08220 -             RW PFDMA Tx General Switch Control
 RTTDT2C   0x04910 +0x04*0..7    RW DCB Transmit Descriptor Plane T2 Config
 RTTPT2C   0x0CD20 +0x04*0..7    RW DCB Transmit Packet Plane T2 Config
-RXPBSIZE  0X03C00 +0x04*0..7    RW Receive Packet Buffer Size
+RXPBSIZE  0x03C00 +0x04*0..7    RW Receive Packet Buffer Size
 TXPBSIZE  0x0CC00 +0x04*0..7    RW Transmit Packet Buffer Size
 TXPBTHRESH 0x04950 +0x04*0..7   RW Tx Packet Buffer Threshold
 ]]
@@ -762,7 +879,7 @@ PFVFTE    0x08110 +0x04*0..1    RW PF VF Transmit Enable
 MTA       0x05200 +0x04*0..127  RW Multicast Table Array
 RAL       0x0A200 +0x08*0..127  RW Receive Address Low
 RAH       0x0A204 +0x08*0..127  RW Receive Address High
-MPSAR     0x0A600 +0x04*0..127  RW MAC Pool Select Array
+MPSAR     0x0A600 +0x04*0..255  RW MAC Pool Select Array
 VFTA      0x0A000 +0x04*0..127  RW VLAN Filter Table Array
 MTQC      0x08120 -             RW Multiple Transmit Queues Command Register
 MRQC      0x0EC80 -             RW Multiple Receive Queues Command Register

@@ -31,29 +31,35 @@ TESTMODS = $(shell find . -regex '[^\#]*\.lua' -printf '%P ' | \
              xargs grep -l '^function selftest *[[:punct:]]' | \
              sed -e 's_\.lua__' -e 's_/_._g')
 
+# TESTSCRIPTS expands to:
+#   lib/watchdog/selftest.sh ...
+# for each executable selftext.sh script in src.
+TESTSCRIPTS = $(shell find . -name "selftest.sh" -executable | xargs)
+
 PATH := ../deps/luajit/usr/local/bin:$(PATH)
 
-all: snabbswitch
+all: snabb
 
 markdown: $(RMOBJS)
 
-snabbswitch: $(LUAOBJ) $(HOBJ) $(COBJ) $(ASMOBJ)
+snabb: $(LUAOBJ) $(HOBJ) $(COBJ) $(ASMOBJ)
 	$(E) "LINK      $@"
-	$(Q) gcc -Wl,-E -Werror -Wall -o $@ $^ \
+	$(Q) gcc -Wl,--no-as-needed -Wl,-E -Werror -Wall -o $@ $^ \
 	    ../deps/luajit/src/libluajit.a \
 	    -lc -ldl -lm -lrt -lpthread
 	@echo -n "Firmware: "
-	@ls -sh snabbswitch
+	@ln -fs snabb snabbswitch
+	@ls -sh snabb
 
-test: $(TESTMODS)
+test: $(TESTMODS) $(TESTSCRIPTS)
 
 test_ci: FAIL_ON_FIRST="true"
 
-test_ci: $(TESTMODS)
+test_ci: $(TESTMODS) $(TESTSCRIPTS)
 
-$(TESTMODS): testlog snabbswitch
+$(TESTMODS): testlog snabb
 	$(E) "TEST      $@"
-	$(Q) ./snabbswitch -t $@ > testlog/$@ || ( \
+	$(Q) ./snabb -t $@ > testlog/$@ 2>&1 || ( \
 		EXITCODE="$$?"; \
 		[ "$$EXITCODE" -eq $(TEST_SKIPPED) ] \
 		&& ( \
@@ -63,6 +69,23 @@ $(TESTMODS): testlog snabbswitch
 		|| ( \
 			echo "ERROR     testlog/$@"; \
 			echo "EXITCODE: $$EXITCODE" >> testlog/$@; \
+			if [ -n "$(FAIL_ON_FIRST)" ]; then exit $$EXITCODE; fi;\
+		) \
+	)
+
+testlog = testlog/$(shell echo "$(@)" | sed -e 's_/_._g')
+$(TESTSCRIPTS): testlog snabb
+	$(E) "TEST      $@"
+	$(Q) ./$@ > $(testlog) 2>&1 || ( \
+		EXITCODE="$$?"; \
+		[ "$$EXITCODE" -eq $(TEST_SKIPPED) ] \
+		&& ( \
+			echo "SKIPPED   $(testlog)"; \
+			echo "EXITCODE: $$EXITCODE" >> $(testlog); \
+		) \
+		|| ( \
+			echo "ERROR     $(testlog)"; \
+			echo "EXITCODE: $$EXITCODE" >> $(testlog); \
 			if [ -n "$(FAIL_ON_FIRST)" ]; then exit $$EXITCODE; fi;\
 		) \
 	)
@@ -77,7 +100,7 @@ $(LUAOBJ): obj/%_lua.o: %.lua Makefile | $(OBJDIR)
 
 $(COBJ): obj/%_c.o: %.c $(CHDR) Makefile | $(OBJDIR)
 	$(E) "C         $@"
-	$(Q) gcc -Wl,-E -I ../deps/luajit/src -I ../deps/include -I . -c -Wall -Werror -o $@ $<
+	$(Q) gcc -Wl,-E -I ../deps/luajit/src -I . -c -Wall -Werror -o $@ $<
 
 $(HOBJ): obj/%_h.o: %.h Makefile | $(OBJDIR)
 	$(E) "H         $@"
@@ -136,7 +159,7 @@ doc/snabbswitch.html doc/snabbswitch.epub: doc/snabbswitch.md
 	$(E) "PANDOC    $@"
 	$(Q) pandoc -S --toc --chapters -o $@ $<
 
-CLEAN = snabbswitch obj doc/snabbswitch.* doc/obj/*.md testlog
+CLEAN = snabb snabbswitch obj doc/snabbswitch.* doc/obj/*.md testlog
 
 clean:
 	$(E) "RM        $(CLEAN)"
